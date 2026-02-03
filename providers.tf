@@ -10,7 +10,7 @@ terraform {
 
   backend "s3" {
     bucket         = "gtn-candidate-tfstate-bucket"
-    key            = "assessment.tfstate"
+    key            = "assessment-part1.tfstate"  # Using new key to avoid corrupted state
     region         = "us-east-2"
   }
 }

@@ -1,0 +1,276 @@
+name: Smart Terraform Pipeline
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+env:
+  TF_VERSION: "1.5.0"
+
+jobs:
+  # Job 1: Detect which modules changed
+  detect-changes:
+    name: Detect Changed Modules
+    runs-on: ubuntu-latest
+    outputs:
+      modules: ${{ steps.set-matrix.outputs.modules }}
+      has_modules: ${{ steps.set-matrix.outputs.has_modules }}
+      terraform_needed: ${{ steps.check-changes.outputs.terraform_needed }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Need full history to compare changes
+
+      - name: Detect changed files
+        id: check-changes
+        run: |
+          # Determine the base ref for comparison
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            BASE_REF="${{ github.event.pull_request.base.sha }}"
+          else
+            # For push events, compare with previous commit
+            BASE_REF="${{ github.event.before }}"
+          fi
+
+          echo "Comparing changes against: $BASE_REF"
+
+          # Get list of changed files
+          CHANGED_FILES=$(git diff --name-only $BASE_REF HEAD)
+          echo "Changed files:"
+          echo "$CHANGED_FILES"
+
+          # Check if any Terraform-related files changed
+          if echo "$CHANGED_FILES" | grep -qE '\.(tf|tfvars)$|^global/|^apps/'; then
+            echo "terraform_needed=true" >> $GITHUB_OUTPUT
+            echo "✅ Terraform changes detected"
+          else
+            echo "terraform_needed=false" >> $GITHUB_OUTPUT
+            echo "ℹ️ No Terraform changes detected (docs/config only)"
+          fi
+
+          # Save changed files for next step
+          echo "$CHANGED_FILES" > /tmp/changed_files.txt
+
+      - name: Determine modules to run
+        id: set-matrix
+        run: |
+          CHANGED_FILES=$(cat /tmp/changed_files.txt)
+          MODULES='[]'
+
+          # Check if global/shared infrastructure changed
+          GLOBAL_CHANGED=false
+          if echo "$CHANGED_FILES" | grep -q '^global/'; then
+            echo "🌍 Global infrastructure changed - will run ALL modules"
+            GLOBAL_CHANGED=true
+          fi
+
+          # Build the matrix of modules to run
+          if [ "$GLOBAL_CHANGED" = true ]; then
+            # Global changed: run all app modules
+            MODULES='[
+              {"name": "global-iam", "path": "global/iam"},
+              {"name": "global-s3", "path": "global/s3"},
+              {"name": "payment-api", "path": "apps/payment-api"},
+              {"name": "user-api", "path": "apps/user-api"}
+            ]'
+          else
+            # Check individual app changes
+            MODULES_ARRAY=()
+
+            # Check payment-api
+            if echo "$CHANGED_FILES" | grep -q '^apps/payment-api/'; then
+              echo "💳 Payment API changed"
+              MODULES_ARRAY+=('{"name": "payment-api", "path": "apps/payment-api"}')
+            fi
+
+            # Check user-api
+            if echo "$CHANGED_FILES" | grep -q '^apps/user-api/'; then
+              echo "👤 User API changed"
+              MODULES_ARRAY+=('{"name": "user-api", "path": "apps/user-api"}')
+            fi
+
+            # Check if specific global modules changed (without triggering all apps)
+            if echo "$CHANGED_FILES" | grep -q '^global/iam/'; then
+              echo "🔐 Global IAM changed"
+              MODULES_ARRAY+=('{"name": "global-iam", "path": "global/iam"}')
+            fi
+
+            if echo "$CHANGED_FILES" | grep -q '^global/s3/'; then
+              echo "🪣 Global S3 changed"
+              MODULES_ARRAY+=('{"name": "global-s3", "path": "global/s3"}')
+            fi
+
+            # Build JSON array
+            if [ ${#MODULES_ARRAY[@]} -gt 0 ]; then
+              MODULES="[$(IFS=,; echo "${MODULES_ARRAY[*]}")]"
+            fi
+          fi
+
+          echo "modules=$MODULES" >> $GITHUB_OUTPUT
+
+          # Check if we have any modules to run
+          if [ "$MODULES" != "[]" ]; then
+            echo "has_modules=true" >> $GITHUB_OUTPUT
+            echo "📋 Modules to run:"
+            echo "$MODULES" | jq -r '.[] | "  - \(.name) (\(.path))"'
+          else
+            echo "has_modules=false" >> $GITHUB_OUTPUT
+            echo "ℹ️ No modules need to run"
+          fi
+
+  # Job 2: Run Terraform plan for detected modules
+  terraform-plan:
+    name: Plan - ${{ matrix.module.name }}
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.has_modules == 'true'
+    strategy:
+      fail-fast: false  # Continue running other modules even if one fails
+      matrix:
+        module: ${{ fromJson(needs.detect-changes.outputs.modules) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Terraform Init
+        id: init
+        working-directory: ${{ matrix.module.path }}
+        run: |
+          terraform init -input=false
+          echo "✅ Initialized ${{ matrix.module.name }}"
+
+      - name: Terraform Validate
+        id: validate
+        working-directory: ${{ matrix.module.path }}
+        run: |
+          terraform validate -no-color
+          echo "✅ Validated ${{ matrix.module.name }}"
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: ${{ matrix.module.path }}
+        run: |
+          # Run plan and save output
+          terraform plan -no-color -input=false -out=tfplan 2>&1 | tee plan_output.txt
+
+          # Check exit code
+          PLAN_EXIT_CODE=${PIPESTATUS[0]}
+
+          # Extract summary from plan output
+          SUMMARY=$(grep -A 10 "Plan:" plan_output.txt || echo "No changes detected")
+
+          echo "summary<<EOF" >> $GITHUB_OUTPUT
+          echo "$SUMMARY" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          exit $PLAN_EXIT_CODE
+
+      - name: Generate Plan Summary
+        if: always()
+        run: |
+          echo "## 📊 Terraform Plan: ${{ matrix.module.name }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Module Path:** \`${{ matrix.module.path }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ steps.plan.outcome }}" == "success" ]; then
+            echo "✅ **Status:** Plan Succeeded" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Status:** Plan Failed" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "<details>" >> $GITHUB_STEP_SUMMARY
+          echo "<summary>📝 Plan Summary</summary>" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat ${{ matrix.module.path }}/plan_output.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "</details>" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+      - name: Comment PR with Plan
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const planOutput = fs.readFileSync('${{ matrix.module.path }}/plan_output.txt', 'utf8');
+            const truncated = planOutput.length > 60000
+              ? planOutput.substring(0, 60000) + '\n\n... (truncated)'
+              : planOutput;
+
+            const body = `### 🏗️ Terraform Plan: \`${{ matrix.module.name }}\`
+
+            **Module:** \`${{ matrix.module.path }}\`
+            **Status:** ${{ steps.plan.outcome == 'success' && '✅ Success' || '❌ Failed' }}
+
+            <details>
+            <summary>Show Plan Output</summary>
+
+            \`\`\`terraform
+            ${truncated}
+            \`\`\`
+
+            </details>`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+  # Job 3: Summary job that runs when no Terraform changes detected
+  skip-terraform:
+    name: Skip Terraform
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.terraform_needed == 'false'
+    steps:
+      - name: Skip message
+        run: |
+          echo "## ℹ️ No Terraform Changes Detected" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Only documentation or non-Terraform files were modified." >> $GITHUB_STEP_SUMMARY
+          echo "Skipping Terraform validation and planning." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Pipeline completed successfully (no action needed)" >> $GITHUB_STEP_SUMMARY
+
+  # Job 4: Final status check
+  pipeline-status:
+    name: Pipeline Status
+    runs-on: ubuntu-latest
+    needs: [detect-changes, terraform-plan]
+    if: always()
+    steps:
+      - name: Check pipeline status
+        run: |
+          echo "## 🎯 Pipeline Execution Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ needs.detect-changes.outputs.terraform_needed }}" == "false" ]; then
+            echo "✅ **Result:** No Terraform changes - pipeline skipped" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.terraform-plan.result }}" == "success" ]; then
+            echo "✅ **Result:** All Terraform plans succeeded" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.terraform-plan.result }}" == "failure" ]; then
+            echo "❌ **Result:** One or more Terraform plans failed" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          else
+            echo "⚠️ **Result:** Terraform plans were skipped" >> $GITHUB_STEP_SUMMARY
+          fi
